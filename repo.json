@@ -3,6 +3,6 @@
   "description": "German providers",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/bnyro/GermanProviders/builds/plugins.json"
+    "https://raw.githubusercontent.com/nici002018/GermanProviders/builds/plugins.json"
   ]
 }
