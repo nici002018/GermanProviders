@@ -34,7 +34,6 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/builds
           git switch --orphan builds
-          git rm -rf .
           git clean -fdx
       
       - name: Clean old builds
