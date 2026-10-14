@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
@@ -76,6 +77,8 @@ open class Aniworld : MainAPI() {
         val document = app.get(url).document
 
         val title = document.selectFirst("div.series-title span")?.text() ?: return null
+        val imdbId = document.selectFirst("a[href*='imdb.com/title/']")?.attr("href")
+            ?.let { Regex("tt\\d+").find(it)?.value }
         val poster = fixUrlNull(document.selectFirst("div.seriesCoverBox img")?.attr("data-src"))
         val tags = document.select("div.genres li a").map { it.text() }
         val year = document.selectFirst("span[itemprop=startDate] a")?.text()?.toIntOrNull()
@@ -111,6 +114,7 @@ open class Aniworld : MainAPI() {
             this.year = year
             this.plot = description
             this.tags = tags
+            addImdbId(imdbId)
 
             addActors(actors)
         }

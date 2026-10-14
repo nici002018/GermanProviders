@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.MainPageRequest
@@ -26,6 +27,7 @@ import kotlinx.coroutines.runBlocking
 import org.jsoup.nodes.Element
 
 open class Serienstream : MainAPI() {
+    // s.to has been retired; the site's supported alternate domain is the canonical host.
     override var mainUrl = "https://serienstream.to"
     override var name = "Serienstream"
     override val supportedTypes = setOf(TvType.TvSeries)
@@ -37,12 +39,12 @@ open class Serienstream : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val document = app.get("$mainUrl/beliebte-serien").document
+        val document = app.get(mainUrl).document
 
-        val homePageLists = document.select(".popular-page > div").map { elem ->
+        val homePageLists = document.select(".popular-page > div, .popular-page section, main section").map { elem ->
             val header = elem.selectFirst("div > h2")?.text() ?: return@map null
 
-            val items = elem.select("a.show-card").mapNotNull {
+            val items = elem.select("a.show-card, a[href*=/serie/], a[href*=/serien/]").mapNotNull {
                 it.toSearchResult()
             }
             HomePageList(header, items).takeIf { items.isNotEmpty() }
@@ -66,11 +68,16 @@ open class Serienstream : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url).document
         val metaContainer = document.selectFirst(".show-header-wrapper .container-fluid > div")
+            ?: document.selectFirst(".show-header-wrapper, .series-header, main")
             ?: throw RuntimeException("Metadata container HTML element not found")
 
         val title = metaContainer.selectFirst("h1")?.text()
             ?: throw RuntimeException("Failed to find series title")
-        val poster = fixUrlNull(metaContainer.selectFirst("img")?.attr("data-src"))
+        val imdbId = document.selectFirst("a[href*='imdb.com/title/']")?.attr("href")
+            ?.let { Regex("tt\\d+").find(it)?.value }
+        val poster = fixUrlNull(metaContainer.selectFirst("img")?.let {
+            it.attr("data-src").ifBlank { it.attr("src") }
+        })
         val year = metaContainer.selectFirst("h1 + p > a")?.text()?.toIntOrNull()
         val description = metaContainer.select(".description-text").text()
         val actors =
@@ -79,19 +86,28 @@ open class Serienstream : MainAPI() {
             metaContainer.select("li.series-group:contains(Genre:) a").map { it.text() }
         val trailerUrl = metaContainer.selectFirst("button[data-trailer-url]")?.attr("data-trailer-url")
 
-        val episodes = document.select("#season-nav ul > li a").amap {
-            val seasonNumber = it.text().trim().toIntOrNull()
-            val seasonDocument = app.get(fixUrl(it.attr("href"))).document
+        val seasons = document.select("#season-nav ul > li a, [id*=season] a[href], a[href*=/staffel/]")
+            .distinctBy { it.attr("href") }
+        val episodes = seasons.amap { seasonLink ->
+            val seasonNumber = Regex("(?:staffel|season)[-/ ]*(\\d+)", RegexOption.IGNORE_CASE)
+                .find(seasonLink.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
+                ?: seasonLink.text().trim().toIntOrNull()
+            val seasonDocument = app.get(fixUrl(seasonLink.attr("href"))).document
 
-            seasonDocument.select(".episode-section .episode-row").map { eps ->
-                val episodeLink = eps.attr("onclick")
-                    .substringAfter("=")
-                    .trim('\'')
+            seasonDocument.select(".episode-section .episode-row, .episode-row, tr:has(.episode-title-cell)")
+                .mapNotNull { eps ->
+                val episodeLink = eps.selectFirst("a[href]")?.attr("href")
+                    ?.takeIf { it.isNotBlank() }
+                    ?: Regex("['\"]([^'\"]+)['\"]").find(eps.attr("onclick"))?.groupValues?.get(1)
+                    ?: return@mapNotNull null
 
-                newEpisode(episodeLink) {
-                    this.episode = eps.selectFirst(".episode-number-cell")?.text()?.toIntOrNull()
+                newEpisode(fixUrl(episodeLink)) {
+                    this.episode = eps.selectFirst(".episode-number-cell, [itemprop=episodeNumber]")
+                        ?.let { it.attr("content").ifBlank { it.text() } }
+                        ?.filter { it.isDigit() }?.toIntOrNull()
                     this.name = eps.select(".episode-title-cell > *")
                         .joinToString(" - ") { el -> el.text() }
+                        .ifBlank { eps.selectFirst(".episode-title-cell, .episode-title, a[href]")?.text() }
                     this.season = seasonNumber
                 }
             }
@@ -108,6 +124,7 @@ open class Serienstream : MainAPI() {
             this.year = year
             this.plot = description
             this.tags = genres
+            addImdbId(imdbId)
             addTrailer(trailerUrl)
 
             addActors(actors)
@@ -121,17 +138,19 @@ open class Serienstream : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        document.select(".link-wrapper > button").amap {
-            val streamUrl = fixUrl(it.attr("data-play-url"))
-            val source = it.attr("data-provider-name")
-            val language = it.attr("data-language-label")
+        document.select(".link-wrapper > button, [data-play-url]").distinctBy { it.attr("data-play-url") }.amap {
+            val playUrl = it.attr("data-play-url").ifBlank { it.attr("data-href") }
+            if (playUrl.isBlank()) return@amap
+            val streamUrl = fixUrl(playUrl)
+            val source = it.attr("data-provider-name").ifBlank { it.attr("data-host-name") }.ifBlank { it.text().trim() }
+            val language = it.attr("data-language-label").ifBlank { it.attr("data-language") }
 
             val redirectedStreamUrl = app.get(fixUrl(streamUrl)).url
             loadExtractor(redirectedStreamUrl, data, subtitleCallback) { link ->
                 val linkWithFixedName = runBlocking {
                     newExtractorLink(
                         source = source,
-                        name =  "$source [$language]",
+                        name = if (language.isBlank()) source else "$source [$language]",
                         url = link.url
                     ) {
                         referer = link.referer
@@ -150,7 +169,9 @@ open class Serienstream : MainAPI() {
 
     private fun Element.toSearchResult(): SearchResponse? {
         val href = fixUrlNull(this.selectFirst("a")?.attr("href")) ?: return null
-        val title = this.selectFirst("img")?.attr("alt") ?: return null
+        val title = this.selectFirst("img")?.attr("alt")?.takeIf { it.isNotBlank() }
+            ?: this.selectFirst(".title, h2, h3")?.text()?.takeIf { it.isNotBlank() }
+            ?: return null
         val posterUrl = fixUrlNull(this.selectFirst("img")?.let {
             it.attr("data-src").ifEmpty { it.attr("src") }
         })
