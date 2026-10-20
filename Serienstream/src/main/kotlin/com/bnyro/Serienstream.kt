@@ -16,6 +16,7 @@ import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.fixUrlNull
+import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
@@ -35,10 +36,25 @@ open class Serienstream : MainAPI() {
     override val hasMainPage = true
     override var lang = "de"
 
+    // "Alle Serien (A–Z)" is the site's complete list: it lets a catalog indexer (MediaServer)
+    // discover every series, page by page.
+    override val mainPage = mainPageOf(
+        "" to "Startseite",
+        ALL_SERIES to "Alle Serien (A–Z)",
+    )
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        if (request.data == ALL_SERIES) {
+            val all = allSeries()
+            val items = all.drop((page - 1) * PAGE_SIZE).take(PAGE_SIZE)
+            return newHomePageResponse(
+                listOf(HomePageList(request.name, items)),
+                hasNext = page * PAGE_SIZE < all.size
+            )
+        }
         val document = app.get(mainUrl).document
 
         val homePageLists = document.select(".popular-page > div, .popular-page section, main section").map { elem ->
@@ -88,6 +104,7 @@ open class Serienstream : MainAPI() {
 
         val seasons = document.select("#season-nav ul > li a, [id*=season] a[href], a[href*=/staffel/]")
             .distinctBy { it.attr("href") }
+        val languages = java.util.concurrent.ConcurrentHashMap<String, List<String>>()
         val episodes = seasons.amap { seasonLink ->
             val seasonNumber = Regex("(?:staffel|season)[-/ ]*(\\d+)", RegexOption.IGNORE_CASE)
                 .find(seasonLink.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
@@ -100,6 +117,12 @@ open class Serienstream : MainAPI() {
                     ?.takeIf { it.isNotBlank() }
                     ?: Regex("['\"]([^'\"]+)['\"]").find(eps.attr("onclick"))?.groupValues?.get(1)
                     ?: return@mapNotNull null
+
+                // The flags of the row: the language versions this episode is offered in.
+                val flags = eps.select(".episode-language-cell svg, .episode-language-cell img").map {
+                    it.className() + " " + it.attr("src") + " " + (it.selectFirst("use")?.attr("href") ?: "")
+                }
+                languages[fixUrl(episodeLink)] = flags.mapNotNull { flagLanguage(it) }.distinct()
 
                 newEpisode(fixUrl(episodeLink)) {
                     this.episode = eps.selectFirst(".episode-number-cell, [itemprop=episodeNumber]")
@@ -128,7 +151,49 @@ open class Serienstream : MainAPI() {
             addTrailer(trailerUrl)
 
             addActors(actors)
+            // Episode languages for MediaServer (indexing, "new episode in German" alerts);
+            // other apps ignore the unknown key.
+            if (languages.values.any { it.isNotEmpty() }) syncData[LANGUAGES_KEY] = languagesJson(languages)
         }
+    }
+
+    /** The complete series list of /serien (cached for six hours). */
+    private suspend fun allSeries(): List<SearchResponse> {
+        val cached = allSeriesCache
+        if (cached != null && System.currentTimeMillis() - cached.first < 6 * 3600_000L) return cached.second
+        val document = app.get("$mainUrl$ALL_SERIES").document
+        val items = document.select("a[href^=/serie/]")
+            .filter { Regex("^/serie/[^/?#]+/?$").matches(it.attr("href")) && it.text().isNotBlank() }
+            .distinctBy { it.attr("href").trimEnd('/') }
+            .map { newTvSeriesSearchResponse(it.text().trim(), fixUrl(it.attr("href")), TvType.TvSeries) }
+        allSeriesCache = System.currentTimeMillis() to items
+        return items
+    }
+
+    companion object {
+        const val ALL_SERIES = "/serien"
+        const val PAGE_SIZE = 500
+        const val LANGUAGES_KEY = "mediaserver.languages"
+        @Volatile private var allSeriesCache: Pair<Long, List<SearchResponse>>? = null
+
+        /** A row flag → language version: de / en (audio), de-sub / en-sub (original audio, subtitles). */
+        fun flagLanguage(flag: String): String? {
+            val f = flag.lowercase()
+            return when {
+                "japanese-german" in f || "german-sub" in f || "untertitel" in f -> "de-sub"
+                "japanese-english" in f || "english-sub" in f -> "en-sub"
+                "german" in f || "deutsch" in f -> "de"
+                "english" in f || "englisch" in f -> "en"
+                else -> null
+            }
+        }
+
+        /** {"<episode url>": ["de", "en"], …} without a JSON library. */
+        fun languagesJson(languages: Map<String, List<String>>): String =
+            languages.entries.joinToString(",", "{", "}") { (url, tags) ->
+                "\"" + url.replace("\\", "\\\\").replace("\"", "\\\"") + "\":" +
+                    tags.joinToString(",", "[", "]") { "\"$it\"" }
+            }
     }
 
     override suspend fun loadLinks(

@@ -16,6 +16,7 @@ import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.fixUrlNull
+import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
@@ -35,10 +36,25 @@ open class Aniworld : MainAPI() {
     override val hasMainPage = true
     override var lang = "de"
 
+    // "Alle Animes (A–Z)" is the site's complete list: it lets a catalog indexer (MediaServer)
+    // discover every anime, page by page.
+    override val mainPage = mainPageOf(
+        "" to "Startseite",
+        ALL_ANIMES to "Alle Animes (A–Z)",
+    )
+
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
+        if (request.data == ALL_ANIMES) {
+            val all = allAnimes()
+            val items = all.drop((page - 1) * PAGE_SIZE).take(PAGE_SIZE)
+            return newHomePageResponse(
+                listOf(HomePageList(request.name, items)),
+                hasNext = page * PAGE_SIZE < all.size
+            )
+        }
         val document = app.get(mainUrl).document
 
         val homePageLists = document.select("div.carousel").map { ele ->
@@ -86,15 +102,18 @@ open class Aniworld : MainAPI() {
         val actors =
             document.select("li:contains(Schauspieler:) ul li a").map { it.select("span").text() }
 
+        val languages = LinkedHashMap<String, List<String>>()
         val episodes = document.select("div#stream > ul:first-child li").mapNotNull { ele ->
             val seasonLink = ele.selectFirst("a") ?: return@mapNotNull null
             val seasonNumber = seasonLink.text().toIntOrNull()
             val seasonDocument = app.get(fixUrl(seasonLink.attr("href"))).document
 
             seasonDocument.select("table.seasonEpisodesList tbody tr").map { eps ->
-                newEpisode(
-                    fixUrl(eps.selectFirst("a")?.attr("href") ?: return@map null),
-                ) {
+                val episodeUrl = fixUrl(eps.selectFirst("a")?.attr("href") ?: return@map null)
+                // The flags of the row: the language versions this episode is offered in.
+                languages[episodeUrl] = eps.select("img.flag")
+                    .mapNotNull { flagLanguage(it.attr("src") + " " + it.attr("title")) }.distinct()
+                newEpisode(episodeUrl) {
                     this.episode = eps.selectFirst("meta[itemprop=episodeNumber]")
                         ?.attr("content")?.toIntOrNull()
                     this.name = eps.selectFirst(".seasonEpisodeTitle")?.text()
@@ -117,7 +136,23 @@ open class Aniworld : MainAPI() {
             addImdbId(imdbId)
 
             addActors(actors)
+            // Episode languages for MediaServer (indexing, "new episode in German" alerts);
+            // other apps ignore the unknown key.
+            if (languages.values.any { it.isNotEmpty() }) syncData[LANGUAGES_KEY] = languagesJson(languages)
         }
+    }
+
+    /** The complete anime list of /animes (cached for six hours). */
+    private suspend fun allAnimes(): List<SearchResponse> {
+        val cached = allAnimesCache
+        if (cached != null && System.currentTimeMillis() - cached.first < 6 * 3600_000L) return cached.second
+        val document = app.get("$mainUrl$ALL_ANIMES").document
+        val items = document.select("a[href^=/anime/stream/]")
+            .filter { Regex("^/anime/stream/[^/?#]+/?$").matches(it.attr("href")) && it.text().isNotBlank() }
+            .distinctBy { it.attr("href").trimEnd('/') }
+            .map { newTvSeriesSearchResponse(it.text().trim(), fixUrl(it.attr("href")), TvType.TvSeries) }
+        allAnimesCache = System.currentTimeMillis() to items
+        return items
     }
 
     override suspend fun loadLinks(
@@ -172,6 +207,32 @@ open class Aniworld : MainAPI() {
     private fun String.getLanguage(document: Document): String? {
         return document.selectFirst("div.changeLanguageBox img[data-lang-key=$this]")
             ?.attr("title")?.removePrefix("mit")?.trim()
+    }
+
+    companion object {
+        const val ALL_ANIMES = "/animes"
+        const val PAGE_SIZE = 500
+        const val LANGUAGES_KEY = "mediaserver.languages"
+        @Volatile private var allAnimesCache: Pair<Long, List<SearchResponse>>? = null
+
+        /** A row flag → language version: de / en (audio), de-sub / en-sub (original audio, subtitles). */
+        fun flagLanguage(flag: String): String? {
+            val f = flag.lowercase()
+            return when {
+                "japanese-german" in f || "german-sub" in f || "untertitel" in f -> "de-sub"
+                "japanese-english" in f || "english-sub" in f -> "en-sub"
+                "german" in f || "deutsch" in f -> "de"
+                "english" in f || "englisch" in f -> "en"
+                else -> null
+            }
+        }
+
+        /** {"<episode url>": ["de", "de-sub"], …} without a JSON library. */
+        fun languagesJson(languages: Map<String, List<String>>): String =
+            languages.entries.joinToString(",", "{", "}") { (url, tags) ->
+                "\"" + url.replace("\\", "\\\\").replace("\"", "\\\"") + "\":" +
+                    tags.joinToString(",", "[", "]") { "\"$it\"" }
+            }
     }
 
     private class SearchResp: ArrayList<SearchItem>()
