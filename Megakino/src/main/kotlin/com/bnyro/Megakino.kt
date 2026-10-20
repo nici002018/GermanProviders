@@ -34,10 +34,13 @@ class Megakino : MainAPI() {
     override var lang = "de"
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Documentary)
 
+    // "Alle Filme" and "Alle Serien" are the site's complete lists (newest first): they let a
+    // catalog indexer (MediaServer) discover every title, page by page.
     override val mainPage = mainPageOf(
         "" to "Trends",
         "kinofilme" to "Kinofilme",
-        "serials" to "Serien",
+        "films" to "Alle Filme",
+        "serials" to "Alle Serien",
         "documentary" to "Dokumentationen",
     )
 
@@ -73,13 +76,15 @@ class Megakino : MainAPI() {
         val home = document.select("#dle-content > a").mapNotNull {
             it.toSearchResult()
         }
+        // Only the "load more" link of the pagination means there is another page.
+        val hasNext = document.selectFirst(".pagination__btn-loader a[href]") != null
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
                 list = home,
                 isHorizontalImages = false
             ),
-            hasNext = true
+            hasNext = hasNext
         )
     }
 
@@ -87,10 +92,15 @@ class Megakino : MainAPI() {
         val title = this.select("h3").text()
         val href = fixUrl(this.attr("href"))
         val posterUrl = fixUrlNull(this.select("img").attr("data-src"))
+        // "United Kingdom, 1962" and "Filme / Adventure / Thriller" (or "Serien / …").
+        val info = this.select(".poster__subtitle li").map { it.text() }
+        val year = info.firstOrNull()?.let { Regex("""(19|20)\d\d""").findAll(it).lastOrNull()?.value?.toIntOrNull() }
+        val type = if (info.getOrNull(1)?.startsWith("Serien") == true) TvType.TvSeries else TvType.Movie
 
-        return newMovieSearchResponse(title, href, TvType.Movie) {
+        return newMovieSearchResponse(title, href, type) {
             this.posterUrl = posterUrl
             this.quality = SearchQuality.HD
+            this.year = year
         }
     }
 
@@ -114,6 +124,8 @@ class Megakino : MainAPI() {
 
         val document = app.get(fixedUrl, cookies = cookies.orEmpty()).document
         val title = document.selectFirst("div.page__subcols.d-flex h1")?.text() ?: "Unknown"
+        // The original (mostly English) title: MediaServer matches IMDb ids with it.
+        val originalTitle = document.selectFirst("div.pmovie__original-title")?.text()?.trim()?.takeIf { it.isNotEmpty() }
         val description = document.selectFirst("div.page__text")?.text()
         val poster =
             fixUrl(document.select("div.pmovie__poster.img-fit-cover img").attr("data-src"))
@@ -147,6 +159,7 @@ class Megakino : MainAPI() {
                 }
 
             newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                originalTitle?.let { syncData[ORIGINAL_TITLE_KEY] = it }
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = genres
@@ -160,6 +173,7 @@ class Megakino : MainAPI() {
 
 
             newMovieLoadResponse(title, url, TvType.Movie, streamLinks) {
+                originalTitle?.let { syncData[ORIGINAL_TITLE_KEY] = it }
                 this.posterUrl = poster
                 this.plot = description
                 this.tags = genres
@@ -185,4 +199,8 @@ class Megakino : MainAPI() {
     }
 
     class Links : ArrayList<String>()
+
+    companion object {
+        const val ORIGINAL_TITLE_KEY = "mediaserver.originalTitle"
+    }
 }
