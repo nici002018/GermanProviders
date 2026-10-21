@@ -10,9 +10,8 @@ import com.lagradost.cloudstream3.SearchQuality
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.amap
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrl
-import com.lagradost.cloudstream3.fixUrlNull
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
@@ -23,11 +22,25 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 
+/**
+ * Megakino (megakino24.com and the domains redirecting to it).
+ *
+ * The site sends every visitor without a fresh `yg_token` cookie a small page that fetches
+ * `/index.php?yg=token` and reloads; the cookie expires after 15 minutes. The token is
+ * renewed before it expires and whenever that page comes back. The site also moves domains:
+ * the redirect of [mainUrl] and known mirrors are tried in turn. Title URLs keep [mainUrl] as
+ * their host (stable identities for apps that store them); requests and images use the
+ * domain that currently answers.
+ *
+ * Series have one page per season ("Brothers - 1 Staffel"): loading a season finds the other
+ * seasons of the same series through the site search and returns one series with all of them.
+ */
 class Megakino : MainAPI() {
-    @Deprecated("Shouldn't be used directly. Use getActualMainUrl instead!")
     override var mainUrl = "https://megakino4.to"
     override var name = "Megakino"
     override val hasMainPage = true
@@ -44,143 +57,214 @@ class Megakino : MainAPI() {
         "documentary" to "Dokumentationen",
     )
 
-    private var urlCookieCache: Pair<Map<String, String>, String>? = null
+    private data class Session(val base: String, val cookies: Map<String, String>, val createdAt: Long)
 
+    @Volatile
+    private var session: Session? = null
 
-    /**
-     * Follow the redirect set on [mainUrl] in order to get the current
-     * base domain of Megakino.
-     *
-     * That workaround is needed because they change they TLDs almost daily.
-     */
-    @Suppress("DEPRECATION")
-    private suspend fun getActualMainUrlAndCookies(): Pair<Map<String, String>, String> {
-        urlCookieCache?.let { return it }
+    /** The redirect of [mainUrl] first, then mirrors the site used. */
+    private val mirrors = listOf("https://megakino4.to", "https://megakino24.com", "https://megakino1.to")
 
-        // follow redirects to get the real base url
-        val actualMainUrl = app.get(mainUrl).url.trimEnd('/')
-        // get cookies to send with each request
-        val cookies = app.get("$actualMainUrl/index.php?yg=token").cookies
+    private suspend fun session(renew: Boolean = false, moveDomain: Boolean = false): Session {
+        val current = session
+        if (current != null && !renew && !moveDomain && System.currentTimeMillis() - current.createdAt < TOKEN_LIFETIME_MS) return current
+        val base = if (current != null && !moveDomain) current.base else findBase()
+        val cookies = try {
+            app.get("$base/index.php?yg=token", headers = HEADERS, referer = "$base/").cookies
+        } catch (e: Throwable) {
+            emptyMap()
+        }
+        return Session(base, cookies, System.currentTimeMillis()).also { session = it }
+    }
 
-        return cookies to actualMainUrl
+    private suspend fun findBase(): String {
+        for (mirror in mirrors) {
+            try {
+                val response = app.get(mirror, headers = HEADERS, timeout = 20)
+                if (response.code in 200..299) return baseOf(response.url)
+            } catch (e: Throwable) {
+                // Blocked or gone: the next mirror.
+            }
+        }
+        return mirrors[1]
+    }
+
+    /** The token page instead of content: the cookie is missing or expired. */
+    private fun gated(html: String) = html.contains("index.php?yg=token") && !html.contains("dle-content")
+
+    /** GET of a site path with the token, renewed (and the domain re-checked) when needed. */
+    private suspend fun page(path: String): Document {
+        var s = session()
+        for (attempt in 0..2) {
+            val html = try {
+                app.get(s.base + path, headers = HEADERS, cookies = s.cookies, referer = "${s.base}/").text
+            } catch (e: Throwable) {
+                if (attempt == 2) throw e
+                s = session(moveDomain = true)
+                continue
+            }
+            if (!gated(html)) return Jsoup.parse(html, s.base)
+            s = session(renew = true, moveDomain = attempt == 1)
+        }
+        throw IllegalStateException("Megakino answers only with its token page")
+    }
+
+    private suspend fun searchPage(query: String): Document {
+        var s = session()
+        for (attempt in 0..2) {
+            val html = app.post(
+                s.base + "/",
+                headers = HEADERS,
+                cookies = s.cookies,
+                referer = "${s.base}/",
+                data = mapOf("do" to "search", "subaction" to "search", "story" to query),
+            ).text
+            if (!gated(html)) return Jsoup.parse(html, s.base)
+            s = session(renew = true, moveDomain = attempt == 1)
+        }
+        throw IllegalStateException("Megakino answers only with its token page")
+    }
+
+    /** A path ("/films/1-x.html") under [mainUrl]: the stable URL of a title. */
+    private fun titleUrl(href: String): String {
+        val path = try { URI(href).rawPath } catch (e: Exception) { href }
+        return mainUrl + (if (path.startsWith("/")) path else "/$path")
+    }
+
+    /** An image path on the domain that currently answers. */
+    private fun image(base: String, src: String?): String? {
+        if (src.isNullOrBlank() || src.contains("no-img")) return null
+        return when {
+            src.startsWith("http") -> src
+            src.startsWith("//") -> "https:$src"
+            else -> base + (if (src.startsWith("/")) src else "/$src")
+        }
+    }
+
+    private fun Element.toSearchResult(base: String): SearchResponse? {
+        val title = selectFirst("h3")?.text()?.trim().orEmpty()
+        val href = attr("href")
+        if (title.isEmpty() || href.isBlank()) return null
+        // "United Kingdom, 1962" and "Filme / Adventure / Thriller" (or "Serien / …").
+        val info = select(".poster__subtitle li").map { it.text() }
+        val year = info.firstOrNull()?.let { yearOf(it) }
+        val series = info.getOrNull(1)?.startsWith("Serien") == true || seasonOf(title) != null
+        val label = selectFirst(".poster__label")?.text()
+        return newMovieSearchResponse(title, titleUrl(href), if (series) TvType.TvSeries else TvType.Movie, fix = false) {
+            this.posterUrl = image(base, selectFirst("img")?.attr("data-src"))
+            this.year = year
+            this.quality = if (label.equals("CAM", true)) SearchQuality.Cam else SearchQuality.HD
+        }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val (cookies, actualMainUrl) = getActualMainUrlAndCookies()
-
-        val document =
-            app.get(
-                "$actualMainUrl/${request.data}/page/$page",
-                cookies = cookies
-            ).document
-        val home = document.select("#dle-content > a").mapNotNull {
-            it.toSearchResult()
-        }
+        val path = if (request.data.isEmpty()) "/page/$page/" else "/${request.data}/page/$page/"
+        val document = page(path)
+        val base = session().base
+        val home = document.select("#dle-content > a").mapNotNull { it.toSearchResult(base) }
         // Only the "load more" link of the pagination means there is another page.
         val hasNext = document.selectFirst(".pagination__btn-loader a[href]") != null
         return newHomePageResponse(
-            list = HomePageList(
-                name = request.name,
-                list = home,
-                isHorizontalImages = false
-            ),
-            hasNext = hasNext
+            list = HomePageList(name = request.name, list = home, isHorizontalImages = false),
+            hasNext = hasNext,
         )
     }
 
-    private fun Element.toSearchResult(): SearchResponse {
-        val title = this.select("h3").text()
-        val href = fixUrl(this.attr("href"))
-        val posterUrl = fixUrlNull(this.select("img").attr("data-src"))
-        // "United Kingdom, 1962" and "Filme / Adventure / Thriller" (or "Serien / …").
-        val info = this.select(".poster__subtitle li").map { it.text() }
-        val year = info.firstOrNull()?.let { Regex("""(19|20)\d\d""").findAll(it).lastOrNull()?.value?.toIntOrNull() }
-        val type = if (info.getOrNull(1)?.startsWith("Serien") == true) TvType.TvSeries else TvType.Movie
-
-        return newMovieSearchResponse(title, href, type) {
-            this.posterUrl = posterUrl
-            this.quality = SearchQuality.HD
-            this.year = year
-        }
-    }
-
     override suspend fun search(query: String): List<SearchResponse> {
-        val (cookies, actualMainUrl) = getActualMainUrlAndCookies()
-
-        val data =
-            mapOf("do" to "search", "subaction" to "search", "story" to query.replace(" ", "+"))
-        val response =
-            app.post(actualMainUrl, data = data, cookies = cookies.orEmpty()).document
-
-        return response.select("a.poster.grid-item").map {
-            it.toSearchResult()
-        }
+        val document = searchPage(query)
+        val base = session().base
+        return document.select("a.poster.grid-item").mapNotNull { it.toSearchResult(base) }
     }
+
+    /** Hoster links per episode of one season page (the site's select boxes "ep1", "ep2", …). */
+    private fun episodesOf(document: Document): List<Pair<Int, List<String>>> =
+        document.select("select[name=pmovie__select-items]")
+            .filter { it.id().startsWith("ep") }
+            .mapNotNull { select ->
+                val number = select.id().takeLastWhile { it.isDigit() }.toIntOrNull() ?: return@mapNotNull null
+                val links = select.select("option").map { it.attr("value").trim() }.filter { it.startsWith("http") || it.startsWith("//") }
+                    .map { if (it.startsWith("//")) "https:$it" else it }
+                if (links.isEmpty()) null else number to links
+            }
 
     override suspend fun load(url: String): LoadResponse {
-        // replace base url with the redirected main url
-        val (cookies, actualMainUrl) = getActualMainUrlAndCookies()
-        val fixedUrl = actualMainUrl + URI.create(url).rawPath
-
-        val document = app.get(fixedUrl, cookies = cookies.orEmpty()).document
-        val title = document.selectFirst("div.page__subcols.d-flex h1")?.text() ?: "Unknown"
+        val path = try { URI(url).rawPath } catch (e: Exception) { url }
+        val document = page(path)
+        val base = session().base
+        val title = document.selectFirst("div.page__subcols.d-flex h1")?.text()?.trim()
+            ?: document.selectFirst("h1")?.text()?.trim() ?: "Unknown"
         // The original (mostly English) title: MediaServer matches IMDb ids with it.
         val originalTitle = document.selectFirst("div.pmovie__original-title")?.text()?.trim()?.takeIf { it.isNotEmpty() }
-        val description = document.selectFirst("div.page__text")?.text()
-        val poster =
-            fixUrl(document.select("div.pmovie__poster.img-fit-cover img").attr("data-src"))
-        val year = document.select("div.pmovie__year > span:nth-child(2)").text().toIntOrNull()
-        val genres = document.selectFirst("div.pmovie__genres")?.text()
-            ?.split(" / ")?.map { it.trim() } ?: emptyList()
+        val description = document.selectFirst("div.page__text")?.text()?.trim()
+        val poster = image(base, document.selectFirst("div.pmovie__poster img")?.attr("data-src"))
+        val year = document.selectFirst("div.pmovie__year")?.text()?.let { yearOf(it) }
+        val genres = document.selectFirst("div.pmovie__genres")?.text()?.split("/")?.map { it.trim() }?.filter { it.isNotEmpty() } ?: emptyList()
+        val trailer = document.select("link[itemprop=embedUrl]").attr("href").takeIf { it.isNotBlank() }
+        val related = document.select("section.pmovie__related a.poster").mapNotNull { it.toSearchResult(base) }
+        val ownEpisodes = episodesOf(document)
+        val isSeries = genres.firstOrNull() == "Serien" || ownEpisodes.isNotEmpty() || seasonOf(title) != null
+        val tags = genres.filter { it != "Filme" && it != "Serien" }
 
-        val trailer = document.select("link[itemprop=embedUrl]").attr("href")
-
-        val typeTag = document.select("div.pmovie__genres").text()
-        val type = if (typeTag.contains("Filme")) TvType.Movie else TvType.TvSeries
-        val related = document.select("section.pmovie__related a.poster").map {
-            it.toSearchResult()
+        if (!isSeries) {
+            val links = document.select("div.pmovie__player iframe")
+                .map { it.attr("src").ifBlank { it.attr("data-src") }.trim() }
+                .filter { it.isNotBlank() && it != "about:blank" }
+                .map { if (it.startsWith("//")) "https:$it" else it }
+                .distinct()
+            return newMovieLoadResponse(title, url, TvType.Movie, links.toJson()) {
+                originalTitle?.let { syncData[ORIGINAL_TITLE_KEY] = it }
+                this.posterUrl = poster
+                this.plot = description
+                this.tags = tags
+                this.year = year
+                this.recommendations = related
+                addTrailer(trailer)
+            }
         }
 
-        return if (type == TvType.TvSeries) {
-            val episodes = document.select("select[name=pmovie__select-items]")
-                .filter { it.id().startsWith("ep") }
-                .map {
-                    val episodeNumber = it.id()
-                        .takeLastWhile { c -> c.isDigit() }
-                        .toIntOrNull()
-                    val episodeStreamLinks = it.select("option").map { option ->
-                        option.attr("value")
-                    }
-
-                    newEpisode(episodeStreamLinks.toJson()) {
-                        this.episode = episodeNumber
-                        this.posterUrl = poster
-                    }
+        val seriesTitle = withoutSeason(title)
+        val season = seasonOf(title) ?: 1
+        val seasons = sortedMapOf(season to ownEpisodes)
+        // The other seasons of the series are separate pages: found through the site search.
+        try {
+            val others = searchPage(seriesTitle).select("a.poster.grid-item")
+                .mapNotNull { a ->
+                    val name = a.selectFirst("h3")?.text()?.trim() ?: return@mapNotNull null
+                    val number = seasonOf(name) ?: return@mapNotNull null
+                    if (number == season || !sameSeries(withoutSeason(name), seriesTitle)) return@mapNotNull null
+                    number to a.attr("href")
                 }
-
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                originalTitle?.let { syncData[ORIGINAL_TITLE_KEY] = it }
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = genres
-                this.year = year
-                this.recommendations = related
-                addTrailer(trailer)
+                .distinctBy { it.first }
+                .take(MAX_SEASONS)
+            others.amap { (number, href) ->
+                try {
+                    val other = page(URI(href).rawPath ?: href)
+                    synchronized(seasons) { seasons[number] = episodesOf(other) }
+                } catch (e: Throwable) {
+                    // A season page that fails is left out.
+                }
             }
-        } else {
-            val streamLinks = document.select("div.pmovie__player iframe")
-                .map { it.attr("src").ifEmpty { it.attr("data-src") } }.toJson()
-
-
-            newMovieLoadResponse(title, url, TvType.Movie, streamLinks) {
-                originalTitle?.let { syncData[ORIGINAL_TITLE_KEY] = it }
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = genres
-                this.year = year
-                this.recommendations = related
-                addTrailer(trailer)
+        } catch (e: Throwable) {
+            // Search unavailable: this season only.
+        }
+        val episodes = seasons.flatMap { (s, list) ->
+            list.map { (number, links) ->
+                newEpisode(links.toJson()) {
+                    this.season = s
+                    this.episode = number
+                    this.name = "Episode $number"
+                    this.posterUrl = poster
+                }
             }
+        }
+        return newTvSeriesLoadResponse(seriesTitle, url, TvType.TvSeries, episodes) {
+            syncData[ORIGINAL_TITLE_KEY] = withoutSeason(originalTitle ?: seriesTitle)
+            this.posterUrl = poster
+            this.plot = description
+            this.tags = tags
+            this.year = year
+            this.recommendations = related
+            addTrailer(trailer)
         }
     }
 
@@ -190,11 +274,15 @@ class Megakino : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val links = parseJson<Links>(data)
-        for (link in links) {
-            loadExtractor(link, subtitleCallback, callback)
+        val links = try { parseJson<Links>(data) } catch (e: Exception) { Links() }
+        val referer = "${session().base}/"
+        links.amap { link ->
+            try {
+                loadExtractor(link, referer, subtitleCallback, callback)
+            } catch (e: Throwable) {
+                // A failing hoster does not stop the others.
+            }
         }
-
         return links.isNotEmpty()
     }
 
@@ -202,5 +290,33 @@ class Megakino : MainAPI() {
 
     companion object {
         const val ORIGINAL_TITLE_KEY = "mediaserver.originalTitle"
+        private const val TOKEN_LIFETIME_MS = 10 * 60 * 1000L
+        private const val MAX_SEASONS = 30
+        private val HEADERS = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Accept-Language" to "de-DE,de;q=0.9,en;q=0.8",
+        )
+        private val SEASON = Regex("""\s*[-–:(]?\s*(?:(\d{1,2})\.?\s*(?:Staffel|Season)|(?:Staffel|Season)\s*(\d{1,2}))\s*\)?\s*$""", RegexOption.IGNORE_CASE)
+
+        fun baseOf(url: String): String = URI(url).let { "${it.scheme}://${it.host}" }
+
+        /** The last four-digit year in a text ("United Kingdom, 1962, 110 min" → 1962). */
+        fun yearOf(text: String): Int? = Regex("""\b(19\d\d|20\d\d)\b""").findAll(text).lastOrNull()?.value?.toIntOrNull()
+
+        /** "Brothers - 1 Staffel" → 1, "Dark Staffel 2" → 2, else null. */
+        fun seasonOf(title: String): Int? {
+            val m = SEASON.find(title) ?: return null
+            if (m.range.first == 0) return null
+            return (m.groupValues[1].ifEmpty { m.groupValues[2] }).toIntOrNull()
+        }
+
+        /** The series name without a season suffix. */
+        fun withoutSeason(title: String): String {
+            val m = SEASON.find(title) ?: return title
+            return if (m.range.first == 0) title else title.substring(0, m.range.first).trim()
+        }
+
+        private fun normalized(s: String) = s.lowercase().replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+        fun sameSeries(a: String, b: String) = normalized(a) == normalized(b)
     }
 }
