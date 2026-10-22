@@ -22,6 +22,9 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -62,19 +65,45 @@ class Megakino : MainAPI() {
     @Volatile
     private var session: Session? = null
 
-    /** The redirect of [mainUrl] first, then mirrors the site used. */
-    private val mirrors = listOf("https://megakino4.to", "https://megakino24.com", "https://megakino1.to")
+    /** The domain that answers first, then the redirects of older domains (all end up there). */
+    private val mirrors = listOf("https://megakino24.com", "https://megakino5.org", "https://megakino1.cx", "https://megakino4.to", "https://megakino1.to")
 
-    private suspend fun session(renew: Boolean = false, moveDomain: Boolean = false): Session {
+    /** One token renewal at a time: parallel requests (season pages, the indexer) share it. */
+    private val renewing = Mutex()
+
+    /**
+     * The current session; [renew]: a new token unless another request renewed it after
+     * [seen] (the session that request used) already.
+     */
+    private suspend fun session(renew: Boolean = false, moveDomain: Boolean = false, seen: Session? = null): Session {
         val current = session
         if (current != null && !renew && !moveDomain && System.currentTimeMillis() - current.createdAt < TOKEN_LIFETIME_MS) return current
-        val base = if (current != null && !moveDomain) current.base else findBase()
-        val cookies = try {
-            app.get("$base/index.php?yg=token", headers = HEADERS, referer = "$base/").cookies
+        return renewing.withLock {
+            val now = session
+            // Renewed meanwhile by another request: use that one.
+            if (now != null && seen != null && now !== seen && !moveDomain) return@withLock now
+            if (now != null && !renew && !moveDomain && System.currentTimeMillis() - now.createdAt < TOKEN_LIFETIME_MS) return@withLock now
+            val base = if (now != null && !moveDomain) now.base else findBase()
+            val cookies = token(base)
+            // Give the site a moment to accept the new token.
+            delay(400)
+            Session(base, cookies, System.currentTimeMillis()).also { session = it }
+        }
+    }
+
+    /** The yg_token cookie (read from the response headers too, in case a client drops it). */
+    private suspend fun token(base: String): Map<String, String> {
+        return try {
+            val response = app.get("$base/index.php?yg=token", headers = HEADERS, referer = "$base/")
+            val cookies = response.cookies.toMutableMap()
+            if (!cookies.containsKey("yg_token")) {
+                response.headers.values("set-cookie").firstNotNullOfOrNull { Regex("yg_token=([^;]+)").find(it)?.groupValues?.get(1) }
+                    ?.let { cookies["yg_token"] = it }
+            }
+            cookies
         } catch (e: Throwable) {
             emptyMap()
         }
-        return Session(base, cookies, System.currentTimeMillis()).also { session = it }
     }
 
     private suspend fun findBase(): String {
@@ -93,36 +122,41 @@ class Megakino : MainAPI() {
     private fun gated(html: String) = html.contains("index.php?yg=token") && !html.contains("dle-content")
 
     /** GET of a site path with the token, renewed (and the domain re-checked) when needed. */
+    private fun headers(s: Session) = HEADERS + (s.cookies["yg_token"]?.let { mapOf("Cookie" to "yg_token=$it") } ?: emptyMap())
+
     private suspend fun page(path: String): Document {
         var s = session()
-        for (attempt in 0..2) {
+        for (attempt in 0 until ATTEMPTS) {
             val html = try {
-                app.get(s.base + path, headers = HEADERS, cookies = s.cookies, referer = "${s.base}/").text
+                app.get(s.base + path, headers = headers(s), cookies = s.cookies, referer = "${s.base}/").text
             } catch (e: Throwable) {
-                if (attempt == 2) throw e
-                s = session(moveDomain = true)
+                if (attempt == ATTEMPTS - 1) throw e
+                s = session(moveDomain = true, seen = s)
                 continue
             }
             if (!gated(html)) return Jsoup.parse(html, s.base)
-            s = session(renew = true, moveDomain = attempt == 1)
+            // A new token (the domain checked again on the third try), a little later each time.
+            delay(500L * attempt)
+            s = session(renew = true, moveDomain = attempt == 2, seen = s)
         }
-        throw IllegalStateException("Megakino answers only with its token page")
+        throw IllegalStateException("Megakino is busy (protection page); try again in a minute")
     }
 
     private suspend fun searchPage(query: String): Document {
         var s = session()
-        for (attempt in 0..2) {
+        for (attempt in 0 until ATTEMPTS) {
             val html = app.post(
                 s.base + "/",
-                headers = HEADERS,
+                headers = headers(s),
                 cookies = s.cookies,
                 referer = "${s.base}/",
                 data = mapOf("do" to "search", "subaction" to "search", "story" to query),
             ).text
             if (!gated(html)) return Jsoup.parse(html, s.base)
-            s = session(renew = true, moveDomain = attempt == 1)
+            delay(500L * attempt)
+            s = session(renew = true, moveDomain = attempt == 2, seen = s)
         }
-        throw IllegalStateException("Megakino answers only with its token page")
+        throw IllegalStateException("Megakino is busy (protection page); try again in a minute")
     }
 
     /** A path ("/films/1-x.html") under [mainUrl]: the stable URL of a title. */
@@ -150,7 +184,8 @@ class Megakino : MainAPI() {
         val year = info.firstOrNull()?.let { yearOf(it) }
         val series = info.getOrNull(1)?.startsWith("Serien") == true || seasonOf(title) != null
         val label = selectFirst(".poster__label")?.text()
-        return newMovieSearchResponse(title, titleUrl(href), if (series) TvType.TvSeries else TvType.Movie, fix = false) {
+        // "The Boys - 5 Staffel": one entry per series, the seasons come together on load.
+        return newMovieSearchResponse(withoutSeason(title), titleUrl(href), if (series) TvType.TvSeries else TvType.Movie, fix = false) {
             this.posterUrl = image(base, selectFirst("img")?.attr("data-src"))
             this.year = year
             this.quality = if (label.equals("CAM", true)) SearchQuality.Cam else SearchQuality.HD
@@ -161,7 +196,7 @@ class Megakino : MainAPI() {
         val path = if (request.data.isEmpty()) "/page/$page/" else "/${request.data}/page/$page/"
         val document = page(path)
         val base = session().base
-        val home = document.select("#dle-content > a").mapNotNull { it.toSearchResult(base) }
+        val home = document.select("#dle-content > a").mapNotNull { it.toSearchResult(base) }.distinctBy { it.name.lowercase() to it.type }
         // Only the "load more" link of the pagination means there is another page.
         val hasNext = document.selectFirst(".pagination__btn-loader a[href]") != null
         return newHomePageResponse(
@@ -173,7 +208,7 @@ class Megakino : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val document = searchPage(query)
         val base = session().base
-        return document.select("a.poster.grid-item").mapNotNull { it.toSearchResult(base) }
+        return document.select("a.poster.grid-item").mapNotNull { it.toSearchResult(base) }.distinctBy { it.name.lowercase() to it.type }
     }
 
     /** Hoster links per episode of one season page (the site's select boxes "ep1", "ep2", …). */
@@ -236,12 +271,15 @@ class Megakino : MainAPI() {
                 }
                 .distinctBy { it.first }
                 .take(MAX_SEASONS)
-            others.amap { (number, href) ->
-                try {
-                    val other = page(URI(href).rawPath ?: href)
-                    synchronized(seasons) { seasons[number] = episodesOf(other) }
-                } catch (e: Throwable) {
-                    // A season page that fails is left out.
+            // A few at a time: many parallel requests make the site answer with its token page.
+            others.chunked(3).forEach { chunk ->
+                chunk.amap { (number, href) ->
+                    try {
+                        val other = page(URI(href).rawPath ?: href)
+                        synchronized(seasons) { seasons[number] = episodesOf(other) }
+                    } catch (e: Throwable) {
+                        // A season page that fails is left out.
+                    }
                 }
             }
         } catch (e: Throwable) {
@@ -291,6 +329,7 @@ class Megakino : MainAPI() {
     companion object {
         const val ORIGINAL_TITLE_KEY = "mediaserver.originalTitle"
         private const val TOKEN_LIFETIME_MS = 10 * 60 * 1000L
+        private const val ATTEMPTS = 4
         private const val MAX_SEASONS = 30
         private val HEADERS = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
