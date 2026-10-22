@@ -1,0 +1,88 @@
+[
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=https://aniworld.to.to&sz=%size%",
+        "fileHash": "sha256-2ef1c73d2d8bae5dff3b7f58ff13a5abcd26c2867dad8253e2d5afe65bf6a5f0",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/nici002018/GermanProviders",
+        "fileSize": 22006,
+        "status": 1,
+        "language": "de",
+        "authors": [
+            "Hexated",
+            "Bnyro"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovies"
+        ],
+        "version": 3,
+        "internalName": "Aniworld",
+        "description": "Animes online ansehen und streamen",
+        "url": "https://raw.githubusercontent.com/nici002018/GermanProviders/builds/Aniworld.cs3",
+        "name": "Aniworld"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=https://filmpalast.to&sz=%size%",
+        "fileHash": "sha256-950ce60be093cde48ad6100428be5e44d8bfd800c1cd96297f81d8dc92ad6508",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/nici002018/GermanProviders",
+        "fileSize": 20797,
+        "status": 1,
+        "language": "de",
+        "authors": [
+            "Bnyro"
+        ],
+        "tvTypes": [
+            "TvSeries",
+            "Movie"
+        ],
+        "version": 9,
+        "internalName": "FilmPalast",
+        "description": "Filme & Serien sofort und kostenlos ansehen",
+        "url": "https://raw.githubusercontent.com/nici002018/GermanProviders/builds/FilmPalast.cs3",
+        "name": "FilmPalast"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=https://megakino4.to&sz=%size%",
+        "fileHash": "sha256-a4162f318489b49a96932ca6e016d79fc7710148ee3fea764f2e0b1af4828990",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/nici002018/GermanProviders",
+        "fileSize": 33045,
+        "status": 1,
+        "language": "de",
+        "authors": [
+            "Phisher98",
+            "Bnyro"
+        ],
+        "tvTypes": [
+            "Movie",
+            "TvSeries",
+            "Documentary"
+        ],
+        "version": 9,
+        "internalName": "Megakino",
+        "description": "Kostenlos Filme und Serien auf Deutsch anschauen",
+        "url": "https://raw.githubusercontent.com/nici002018/GermanProviders/builds/Megakino.cs3",
+        "name": "Megakino"
+    },
+    {
+        "iconUrl": "https://www.google.com/s2/favicons?domain=https://serienstream.to&sz=%size%",
+        "fileHash": "sha256-44d357b0aabe14a49478bc3c950ce0ccd04c15b374b8075c488fed7af1e68ad0",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/nici002018/GermanProviders",
+        "fileSize": 21597,
+        "status": 1,
+        "language": "de",
+        "authors": [
+            "Bnyro"
+        ],
+        "tvTypes": [
+            "Series"
+        ],
+        "version": 7,
+        "internalName": "Serienstream",
+        "description": "Serien online ansehen und streamen",
+        "url": "https://raw.githubusercontent.com/nici002018/GermanProviders/builds/Serienstream.cs3",
+        "name": "Serienstream"
+    }
+]
